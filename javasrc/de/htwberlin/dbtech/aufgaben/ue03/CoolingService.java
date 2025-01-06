@@ -29,12 +29,84 @@ public class CoolingService implements ICoolingService {
 
   @Override
   public void transferSample(Integer sampleId, Integer diameterInCM) {
-    L.info("transferSample: sampleId: " + sampleId + ", diameterInCM: " + diameterInCM);
-    if (!isSampleIdExisting(sampleId)) {
-      throw new CoolingSystemException("Sample ID " + sampleId + " does not exist.");
+    L.info("transferSample: sampleId: {}, diameterInCM: {}", sampleId, diameterInCM);
+
+    try {
+      // Prüfen, ob die SampleID existiert
+      if (!isSampleIdExisting(sampleId)) {
+        throw new CoolingSystemException("Sample ID " + sampleId + " does not exist.");
+      }
+
+      // 1. Suche ein passendes Tablett
+      String trayQuery = "SELECT TrayID FROM Tray " +
+              "WHERE Diameter = ? AND ExpirationDate > (SELECT ExpirationDate FROM Sample WHERE SampleID = ?) " +
+              "ORDER BY ExpirationDate ASC LIMIT 1";
+      try (PreparedStatement trayStmt = useConnection().prepareStatement(trayQuery)) {
+        trayStmt.setInt(1, diameterInCM);
+        trayStmt.setInt(2, sampleId);
+
+        try (ResultSet trayResult = trayStmt.executeQuery()) {
+          if (trayResult.next()) {
+            int trayId = trayResult.getInt("TrayID");
+
+            // 2. Finde den kleinsten freien Platz auf dem Tablett
+            String placeQuery = "SELECT PlaceNo FROM Place WHERE TrayID = ? AND SampleID IS NULL ORDER BY PlaceNo ASC LIMIT 1";
+            try (PreparedStatement placeStmt = useConnection().prepareStatement(placeQuery)) {
+              placeStmt.setInt(1, trayId);
+
+              try (ResultSet placeResult = placeStmt.executeQuery()) {
+                if (placeResult.next()) {
+                  int placeNo = placeResult.getInt("PlaceNo");
+
+                  // 3. Setze die Probe auf den Platz
+                  String updatePlace = "UPDATE Place SET SampleID = ? WHERE TrayID = ? AND PlaceNo = ?";
+                  try (PreparedStatement updateStmt = useConnection().prepareStatement(updatePlace)) {
+                    updateStmt.setInt(1, sampleId);
+                    updateStmt.setInt(2, trayId);
+                    updateStmt.setInt(3, placeNo);
+                    updateStmt.executeUpdate();
+                    L.info("Sample {} placed on Tray {}, Place {}", sampleId, trayId, placeNo);
+                  }
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 4. Kein passendes Tablett gefunden, neues Tablett erstellen
+      String newTrayQuery = "INSERT INTO Tray (Diameter, ExpirationDate) VALUES (?, (SELECT ExpirationDate FROM Sample WHERE SampleID = ?) + INTERVAL '30 DAY')";
+      try (PreparedStatement newTrayStmt = useConnection().prepareStatement(newTrayQuery, PreparedStatement.RETURN_GENERATED_KEYS)) {
+        newTrayStmt.setInt(1, diameterInCM);
+        newTrayStmt.setInt(2, sampleId);
+        newTrayStmt.executeUpdate();
+
+        try (ResultSet generatedKeys = newTrayStmt.getGeneratedKeys()) {
+          if (generatedKeys.next()) {
+            int newTrayId = generatedKeys.getInt(1);
+
+            // Erster Platz auf neuem Tablett belegen
+            String firstPlaceQuery = "INSERT INTO Place (TrayID, PlaceNo, SampleID) VALUES (?, 1, ?)";
+            try (PreparedStatement firstPlaceStmt = useConnection().prepareStatement(firstPlaceQuery)) {
+              firstPlaceStmt.setInt(1, newTrayId);
+              firstPlaceStmt.setInt(2, sampleId);
+              firstPlaceStmt.executeUpdate();
+              L.info("Sample {} placed on new Tray {}", sampleId, newTrayId);
+            }
+          }
+        }
+      }
+
+      // 5. Kein Tablett gefunden oder erstellt
+      throw new CoolingSystemException("No available tray for Sample ID " + sampleId + " with diameter " + diameterInCM);
+
+    } catch (SQLException e) {
+      L.error("Database error during transferSample", e);
+      throw new DataException("Database error", e);
     }
-    // TODO: Implement further logic
   }
+
 
   /**
    * Checks if the sample ID exists in the database.

@@ -1,34 +1,42 @@
 package de.htwberlin.dbtech.exceptions;
 
 /**
- * @author Ingo Classen
+ * Eine benutzerdefinierte Ausnahme für Datenbankfehler.
  */
 public class DataException extends RuntimeException {
 
   /**
-   * Erzeugt eine DataException.
+   * Erzeugt eine DataException ohne Nachricht oder Ursache.
    */
   public DataException() {
+    super();
   }
 
   /**
    * Erzeugt eine DataException mit einer Nachricht.
-   * 
-   * @param msg
-   *          - die Nachricht
+   *
+   * @param message - die Fehlermeldung.
    */
-  public DataException(String msg) {
-    super(msg);
+  public DataException(String message) {
+    super(message);
   }
 
   /**
-   * Erzeugt eine DataException und verweist auf ein Throwable t.
-   * 
-   * @param t
-   *          - das Throwable.
+   * Erzeugt eine DataException mit einer Ursache.
+   *
+   * @param cause - die zugrunde liegende Ausnahme.
    */
-  public DataException(Throwable t) {
-    super(t);
+  public DataException(Throwable cause) {
+    super(cause);
   }
 
+  /**
+   * Erzeugt eine DataException mit einer Nachricht und einer Ursache.
+   *
+   * @param message - die Fehlermeldung.
+   * @param cause - die zugrunde liegende Ausnahme.
+   */
+  public DataException(String message, Throwable cause) {
+    super(message, cause);
+  }
 }
