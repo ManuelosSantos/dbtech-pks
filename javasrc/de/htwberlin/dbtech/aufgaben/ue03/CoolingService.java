@@ -1,4 +1,6 @@
 package de.htwberlin.dbtech.aufgaben.ue03;
+import java.sql.Date;
+import java.time.temporal.ChronoUnit;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -37,75 +39,88 @@ public class CoolingService implements ICoolingService {
         throw new CoolingSystemException("Sample ID " + sampleId + " does not exist.");
       }
 
-      // 1. Suche ein passendes Tablett
-      String trayQuery = "SELECT TrayID FROM Tray " +
-              "WHERE Diameter = ? AND ExpirationDate > (SELECT ExpirationDate FROM Sample WHERE SampleID = ?) " +
+      // Abrufen des Ablaufdatums der Probe
+      String sampleQuery = "SELECT ExpirationDate FROM Sample WHERE SampleID = ?";
+      Date sampleExpirationDate;
+      try (PreparedStatement stmt = useConnection().prepareStatement(sampleQuery)) {
+        stmt.setInt(1, sampleId);
+        try (ResultSet rs = stmt.executeQuery()) {
+          if (rs.next()) {
+            sampleExpirationDate = rs.getDate("ExpirationDate");
+          } else {
+            throw new CoolingSystemException("Sample ID " + sampleId + " does not exist.");
+          }
+        }
+      }
+
+      // Schritt 1: Passendes Tablett finden
+      String trayQuery = "SELECT TrayID, ExpirationDate FROM Tray " +
+              "WHERE Diameter = ? AND ExpirationDate > ? " +
               "ORDER BY ExpirationDate ASC LIMIT 1";
+      Integer trayId = null;
+      Date trayExpirationDate = null;
+
       try (PreparedStatement trayStmt = useConnection().prepareStatement(trayQuery)) {
         trayStmt.setInt(1, diameterInCM);
-        trayStmt.setInt(2, sampleId);
-
+        trayStmt.setDate(2, sampleExpirationDate);
         try (ResultSet trayResult = trayStmt.executeQuery()) {
           if (trayResult.next()) {
-            int trayId = trayResult.getInt("TrayID");
+            trayId = trayResult.getInt("TrayID");
+            trayExpirationDate = trayResult.getDate("ExpirationDate");
+          }
+        }
+      }
 
-            // 2. Finde den kleinsten freien Platz auf dem Tablett
-            String placeQuery = "SELECT PlaceNo FROM Place WHERE TrayID = ? AND SampleID IS NULL ORDER BY PlaceNo ASC LIMIT 1";
-            try (PreparedStatement placeStmt = useConnection().prepareStatement(placeQuery)) {
-              placeStmt.setInt(1, trayId);
-
-              try (ResultSet placeResult = placeStmt.executeQuery()) {
-                if (placeResult.next()) {
-                  int placeNo = placeResult.getInt("PlaceNo");
-
-                  // 3. Setze die Probe auf den Platz
-                  String updatePlace = "UPDATE Place SET SampleID = ? WHERE TrayID = ? AND PlaceNo = ?";
-                  try (PreparedStatement updateStmt = useConnection().prepareStatement(updatePlace)) {
-                    updateStmt.setInt(1, sampleId);
-                    updateStmt.setInt(2, trayId);
-                    updateStmt.setInt(3, placeNo);
-                    updateStmt.executeUpdate();
-                    L.info("Sample {} placed on Tray {}, Place {}", sampleId, trayId, placeNo);
-                  }
-                  return;
-                }
-              }
+      // Schritt 2: Wenn kein passendes Tablett gefunden wurde, ein neues erstellen
+      if (trayId == null) {
+        String newTrayQuery = "INSERT INTO Tray (Diameter, ExpirationDate) " +
+                "VALUES (?, ?)";
+        try (PreparedStatement newTrayStmt = useConnection().prepareStatement(newTrayQuery, PreparedStatement.RETURN_GENERATED_KEYS)) {
+          newTrayStmt.setInt(1, diameterInCM);
+          newTrayStmt.setDate(2, new java.sql.Date(sampleExpirationDate.toInstant().plus(30, ChronoUnit.DAYS).toEpochMilli()));
+          newTrayStmt.executeUpdate();
+          try (ResultSet generatedKeys = newTrayStmt.getGeneratedKeys()) {
+            if (generatedKeys.next()) {
+              trayId = generatedKeys.getInt(1);
             }
           }
         }
       }
 
-      // 4. Kein passendes Tablett gefunden, neues Tablett erstellen
-      String newTrayQuery = "INSERT INTO Tray (Diameter, ExpirationDate) VALUES (?, (SELECT ExpirationDate FROM Sample WHERE SampleID = ?) + INTERVAL '30 DAY')";
-      try (PreparedStatement newTrayStmt = useConnection().prepareStatement(newTrayQuery, PreparedStatement.RETURN_GENERATED_KEYS)) {
-        newTrayStmt.setInt(1, diameterInCM);
-        newTrayStmt.setInt(2, sampleId);
-        newTrayStmt.executeUpdate();
+      // Schritt 3: Freien Platz im Tablett finden
+      String placeQuery = "SELECT PlaceNo FROM Place WHERE TrayID = ? AND SampleID IS NULL ORDER BY PlaceNo ASC LIMIT 1";
+      Integer placeNo = null;
 
-        try (ResultSet generatedKeys = newTrayStmt.getGeneratedKeys()) {
-          if (generatedKeys.next()) {
-            int newTrayId = generatedKeys.getInt(1);
-
-            // Erster Platz auf neuem Tablett belegen
-            String firstPlaceQuery = "INSERT INTO Place (TrayID, PlaceNo, SampleID) VALUES (?, 1, ?)";
-            try (PreparedStatement firstPlaceStmt = useConnection().prepareStatement(firstPlaceQuery)) {
-              firstPlaceStmt.setInt(1, newTrayId);
-              firstPlaceStmt.setInt(2, sampleId);
-              firstPlaceStmt.executeUpdate();
-              L.info("Sample {} placed on new Tray {}", sampleId, newTrayId);
-            }
+      try (PreparedStatement placeStmt = useConnection().prepareStatement(placeQuery)) {
+        placeStmt.setInt(1, trayId);
+        try (ResultSet placeResult = placeStmt.executeQuery()) {
+          if (placeResult.next()) {
+            placeNo = placeResult.getInt("PlaceNo");
           }
         }
       }
 
-      // 5. Kein Tablett gefunden oder erstellt
-      throw new CoolingSystemException("No available tray for Sample ID " + sampleId + " with diameter " + diameterInCM);
+      // Schritt 4: Wenn kein Platz gefunden wurde, Exception werfen
+      if (placeNo == null) {
+        throw new CoolingSystemException("No available place in tray " + trayId);
+      }
+
+      // Schritt 5: Platz belegen
+      String updatePlaceQuery = "UPDATE Place SET SampleID = ? WHERE TrayID = ? AND PlaceNo = ?";
+      try (PreparedStatement updatePlaceStmt = useConnection().prepareStatement(updatePlaceQuery)) {
+        updatePlaceStmt.setInt(1, sampleId);
+        updatePlaceStmt.setInt(2, trayId);
+        updatePlaceStmt.setInt(3, placeNo);
+        updatePlaceStmt.executeUpdate();
+        L.info("Sample {} placed on Tray {}, Place {}", sampleId, trayId, placeNo);
+      }
 
     } catch (SQLException e) {
       L.error("Database error during transferSample", e);
       throw new DataException("Database error", e);
     }
   }
+
 
 
   /**
