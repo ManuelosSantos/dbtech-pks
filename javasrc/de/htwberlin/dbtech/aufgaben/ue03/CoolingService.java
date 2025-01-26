@@ -1,6 +1,4 @@
 package de.htwberlin.dbtech.aufgaben.ue03;
-import java.sql.Date;
-import java.time.temporal.ChronoUnit;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -8,13 +6,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 
 import de.htwberlin.dbtech.exceptions.CoolingSystemException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import de.htwberlin.dbtech.exceptions.DataException;
 
 public class CoolingService implements ICoolingService {
-  private static final Logger L = LoggerFactory.getLogger(CoolingService.class);
+
   private Connection connection;
 
   @Override
@@ -22,126 +16,104 @@ public class CoolingService implements ICoolingService {
     this.connection = connection;
   }
 
-  private Connection useConnection() {
-    if (connection == null) {
-      throw new DataException("Connection not set");
-    }
-    return connection;
-  }
-
   @Override
-  public void transferSample(Integer sampleId, Integer diameterInCM) {
-    L.info("transferSample: sampleId: {}, diameterInCM: {}", sampleId, diameterInCM);
-
+  public void transferSample(Integer sampleId, Integer diameter) {
     try {
-      // Prüfen, ob die SampleID existiert
-      if (!isSampleIdExisting(sampleId)) {
-        throw new CoolingSystemException("Sample ID " + sampleId + " does not exist.");
+      if (connection == null || connection.isClosed()) {
+        throw new IllegalStateException("Connection is not set or is closed.");
       }
 
-      // Abrufen des Ablaufdatums der Probe
-      String sampleQuery = "SELECT ExpirationDate FROM Sample WHERE SampleID = ?";
-      Date sampleExpirationDate;
-      try (PreparedStatement stmt = useConnection().prepareStatement(sampleQuery)) {
-        stmt.setInt(1, sampleId);
-        try (ResultSet rs = stmt.executeQuery()) {
-          if (rs.next()) {
-            sampleExpirationDate = rs.getDate("ExpirationDate");
-          } else {
-            throw new CoolingSystemException("Sample ID " + sampleId + " does not exist.");
-          }
-        }
+      // Check if the sample exists
+      if (!sampleExists(sampleId)) {
+        throw new CoolingSystemException("Sample does not exist.");
       }
 
-      // Schritt 1: Passendes Tablett finden
-      String trayQuery = "SELECT TrayID, ExpirationDate FROM Tray " +
-              "WHERE Diameter = ? AND ExpirationDate > ? " +
-              "ORDER BY ExpirationDate ASC LIMIT 1";
-      Integer trayId = null;
-      Date trayExpirationDate = null;
+      // Get sample expiration date
+      String sampleExpiration = getSampleExpiration(sampleId);
 
-      try (PreparedStatement trayStmt = useConnection().prepareStatement(trayQuery)) {
-        trayStmt.setInt(1, diameterInCM);
-        trayStmt.setDate(2, sampleExpirationDate);
-        try (ResultSet trayResult = trayStmt.executeQuery()) {
-          if (trayResult.next()) {
-            trayId = trayResult.getInt("TrayID");
-            trayExpirationDate = trayResult.getDate("ExpirationDate");
-          }
-        }
-      }
-
-      // Schritt 2: Wenn kein passendes Tablett gefunden wurde, ein neues erstellen
+      // Find a suitable tray
+      Integer trayId = findSuitableTray(diameter, sampleExpiration);
       if (trayId == null) {
-        String newTrayQuery = "INSERT INTO Tray (Diameter, ExpirationDate) " +
-                "VALUES (?, ?)";
-        try (PreparedStatement newTrayStmt = useConnection().prepareStatement(newTrayQuery, PreparedStatement.RETURN_GENERATED_KEYS)) {
-          newTrayStmt.setInt(1, diameterInCM);
-          newTrayStmt.setDate(2, new java.sql.Date(sampleExpirationDate.toInstant().plus(30, ChronoUnit.DAYS).toEpochMilli()));
-          newTrayStmt.executeUpdate();
-          try (ResultSet generatedKeys = newTrayStmt.getGeneratedKeys()) {
-            if (generatedKeys.next()) {
-              trayId = generatedKeys.getInt(1);
-            }
-          }
-        }
+        throw new CoolingSystemException("No suitable tray found.");
       }
 
-      // Schritt 3: Freien Platz im Tablett finden
-      String placeQuery = "SELECT PlaceNo FROM Place WHERE TrayID = ? AND SampleID IS NULL ORDER BY PlaceNo ASC LIMIT 1";
-      Integer placeNo = null;
-
-      try (PreparedStatement placeStmt = useConnection().prepareStatement(placeQuery)) {
-        placeStmt.setInt(1, trayId);
-        try (ResultSet placeResult = placeStmt.executeQuery()) {
-          if (placeResult.next()) {
-            placeNo = placeResult.getInt("PlaceNo");
-          }
-        }
-      }
-
-      // Schritt 4: Wenn kein Platz gefunden wurde, Exception werfen
+      // Find a free place in the tray
+      Integer placeNo = findFreePlaceInTray(trayId);
       if (placeNo == null) {
-        throw new CoolingSystemException("No available place in tray " + trayId);
+        throw new CoolingSystemException("No free place in the tray.");
       }
 
-      // Schritt 5: Platz belegen
-      String updatePlaceQuery = "UPDATE Place SET SampleID = ? WHERE TrayID = ? AND PlaceNo = ?";
-      try (PreparedStatement updatePlaceStmt = useConnection().prepareStatement(updatePlaceQuery)) {
-        updatePlaceStmt.setInt(1, sampleId);
-        updatePlaceStmt.setInt(2, trayId);
-        updatePlaceStmt.setInt(3, placeNo);
-        updatePlaceStmt.executeUpdate();
-        L.info("Sample {} placed on Tray {}, Place {}", sampleId, trayId, placeNo);
-      }
-
+      // Transfer the sample to the tray
+      assignSampleToPlace(trayId, placeNo, sampleId);
     } catch (SQLException e) {
-      L.error("Database error during transferSample", e);
-      throw new DataException("Database error", e);
+      throw new CoolingSystemException("Database error: " + e.getMessage(), e);
     }
   }
 
-
-
-  /**
-   * Checks if the sample ID exists in the database.
-   *
-   * @param sampleId The sample ID to check.
-   * @return true if the sample ID exists, otherwise false.
-   */
-  private boolean isSampleIdExisting(Integer sampleId) {
+  private boolean sampleExists(Integer sampleId) throws SQLException {
     String query = "SELECT COUNT(*) FROM Sample WHERE SampleID = ?";
-    try (PreparedStatement stmt = useConnection().prepareStatement(query)) {
+    try (PreparedStatement stmt = connection.prepareStatement(query)) {
       stmt.setInt(1, sampleId);
       try (ResultSet rs = stmt.executeQuery()) {
         if (rs.next()) {
           return rs.getInt(1) > 0;
         }
       }
-    } catch (SQLException e) {
-      L.error("Error checking if Sample ID exists: " + sampleId, e);
-      throw new CoolingSystemException("Error checking if Sample ID exists", e);
     }
     return false;
+  }
+
+  private String getSampleExpiration(Integer sampleId) throws SQLException {
+    String query = "SELECT TO_CHAR(ExpirationDate, 'YYYY-MM-DD') AS ExpirationDate FROM Sample WHERE SampleID = ?";
+    try (PreparedStatement stmt = connection.prepareStatement(query)) {
+      stmt.setInt(1, sampleId);
+      try (ResultSet rs = stmt.executeQuery()) {
+        if (rs.next()) {
+          return rs.getString("ExpirationDate");
+        }
+      }
+    }
+    throw new CoolingSystemException("Sample expiration date not found.");
+  }
+
+  private Integer findSuitableTray(Integer diameter, String expirationDate) throws SQLException {
+    String query = "SELECT TrayID FROM Tray " +
+            "WHERE DiameterInCM = ? " +
+            "AND (ExpirationDate IS NULL OR TO_DATE(ExpirationDate, 'YYYY-MM-DD') >= TO_DATE(?, 'YYYY-MM-DD')) " +
+            "AND EXISTS (SELECT 1 FROM Place WHERE Tray.TrayID = Place.TrayID AND SampleID IS NULL) " +
+            "ORDER BY TrayID FETCH FIRST 1 ROWS ONLY";
+    try (PreparedStatement stmt = connection.prepareStatement(query)) {
+      stmt.setInt(1, diameter);
+      stmt.setString(2, expirationDate);
+      try (ResultSet rs = stmt.executeQuery()) {
+        if (rs.next()) {
+          return rs.getInt("TrayID");
+        }
+      }
+    }
+    return null;
+  }
+
+  private Integer findFreePlaceInTray(Integer trayId) throws SQLException {
+    String query = "SELECT PlaceNo FROM Place WHERE TrayID = ? AND SampleID IS NULL FETCH FIRST 1 ROWS ONLY";
+    try (PreparedStatement stmt = connection.prepareStatement(query)) {
+      stmt.setInt(1, trayId);
+      try (ResultSet rs = stmt.executeQuery()) {
+        if (rs.next()) {
+          return rs.getInt("PlaceNo");
+        }
+      }
+    }
+    return null;
+  }
+
+  private void assignSampleToPlace(Integer trayId, Integer placeNo, Integer sampleId) throws SQLException {
+    String query = "UPDATE Place SET SampleID = ? WHERE TrayID = ? AND PlaceNo = ?";
+    try (PreparedStatement stmt = connection.prepareStatement(query)) {
+      stmt.setInt(1, sampleId);
+      stmt.setInt(2, trayId);
+      stmt.setInt(3, placeNo);
+      stmt.executeUpdate();
+    }
   }
 }
